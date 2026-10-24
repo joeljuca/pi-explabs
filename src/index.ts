@@ -26,7 +26,16 @@ const API_FORMATS: readonly ApiFormat[] = [
 interface ExperientialLabsConfig {
   /** Base URL for the API (default: reads from EXPLABS_BASE_URL env var, falls back to https://api.experientiallabs.ai/v1) */
   baseUrl?: string;
-  /** Environment variable name for the API key (default: EXPLABS_API_KEY) */
+  /**
+   * API key literal, `$ENV_VAR` reference, or leading `!command`, registered with pi
+   * unresolved. Used only when `auth.json` has no `explabs` entry — a stored credential
+   * always wins, matching pi's own precedence.
+   */
+  apiKey?: string;
+  /**
+   * Environment variable name for the API key fallback (default: EXPLABS_API_KEY).
+   * Registered as a `$VAR` reference that pi resolves at request time.
+   */
   apiKeyEnv?: string;
   /** API format to use (default: reads from EXPLABS_API_FORMAT env var, falls back to openai-completions) */
   apiFormat?: ApiFormat;
@@ -49,9 +58,9 @@ interface ModelsResponse {
 }
 
 /** Default configuration */
-const DEFAULT_CONFIG: Required<Omit<ExperientialLabsConfig, "apiFormat" | "baseUrl">> = {
+const DEFAULT_CONFIG = {
   apiKeyEnv: "EXPLABS_API_KEY",
-};
+} as const;
 
 const DEFAULT_BASE_URL = "https://api.experientiallabs.ai/v1";
 
@@ -105,7 +114,18 @@ export function createExplabsExtension(config?: ExperientialLabsConfig) {
   const apiKeyEnv = config?.apiKeyEnv ?? DEFAULT_CONFIG.apiKeyEnv;
   const apiFormat = resolveApiFormat(config?.apiFormat);
 
-  debug("config: baseUrl=%s apiKeyEnv=%s apiFormat=%s", baseUrl, apiKeyEnv, apiFormat);
+  // What pi should use when auth.json has no `explabs` credential: an explicit key
+  // wins over the environment reference. The value stays unresolved — pi resolves
+  // $VAR / !command / literals itself and always prefers a stored credential, so the
+  // extension never reads or resolves the key on its own.
+  const apiKey = config?.apiKey || `$${apiKeyEnv}`;
+
+  debug(
+    "config: baseUrl=%s apiFormat=%s apiKey=%s",
+    baseUrl,
+    apiFormat,
+    config?.apiKey ? "config" : `env:${apiKeyEnv}`,
+  );
 
   return function explabsExtension(pi: ExtensionAPI): void {
     // Intercept /login explabs and show a notification
@@ -114,7 +134,8 @@ export function createExplabsExtension(config?: ExperientialLabsConfig) {
       if (event.text === "/login explabs") {
         debug("/login explabs intercepted, showing API key notice");
         ctx.ui.notify(
-          "Authentication is API key-only. Set EXPLABS_API_KEY environment variable.",
+          "Authentication is API key-only. Add an 'explabs' API key to auth.json " +
+            "(or set the EXPLABS_API_KEY environment variable).",
           "info",
         );
         return { action: "handled" };
@@ -125,11 +146,26 @@ export function createExplabsExtension(config?: ExperientialLabsConfig) {
     pi.registerProvider("explabs", {
       name: "Experiential Labs",
       baseUrl,
-      apiKey: process.env[apiKeyEnv] ?? "",
+      apiKey,
       authHeader: true,
       api: apiFormat,
 
-      async refreshModels({ signal }: { signal: AbortSignal }) {
+      async refreshModels(context) {
+        const { signal, credential, allowNetwork } = context;
+
+        // pi refreshes in two passes: a cache-restore pass before auth is resolved
+        // (allowNetwork=false), then the network pass carrying the effective
+        // credential — stored auth.json entry first, configured apiKey as fallback.
+        if (!allowNetwork) {
+          return [];
+        }
+
+        const key = credential?.type === "api_key" ? credential.key : undefined;
+        if (!key) {
+          debug("pi resolved no API key, skipping model fetch");
+          return [];
+        }
+
         const modelsUrl = `${baseUrl}/models`;
         debug("fetching models from %s", modelsUrl);
 
@@ -137,7 +173,7 @@ export function createExplabsExtension(config?: ExperientialLabsConfig) {
           signal,
           headers: {
             Accept: "application/json",
-            Authorization: `Bearer ${process.env[apiKeyEnv] ?? ""}`,
+            Authorization: `Bearer ${key}`,
           },
         });
 
@@ -181,8 +217,11 @@ export function createExplabsExtension(config?: ExperientialLabsConfig) {
 /**
  * Default extension factory
  *
- * Reads configuration from environment variables:
- * - `EXPLABS_API_KEY`: API key (required)
+ * Reads the API key from pi's `auth.json` (the `explabs` entry), falling back to
+ * the `EXPLABS_API_KEY` environment variable.
+ *
+ * Other configuration comes from environment variables:
+ * - `EXPLABS_API_KEY`: API key (fallback when `auth.json` has no `explabs` key)
  * - `EXPLABS_BASE_URL`: API endpoint URL (default: "https://api.experientiallabs.ai/v1")
  * - `EXPLABS_API_FORMAT`: API format - "openai-completions", "openai-responses", or "anthropic-messages" (default: "openai-completions")
  */

@@ -13,6 +13,7 @@
 - 🔍 **Dynamic model discovery** — models are fetched live from the Experiential Labs API
 - 🔄 **Auto-refresh** — model list updates when you open `/model` in pi
 - 🛠️ **Zero configuration** — just set your API key and go
+- 🔑 **Flexible credentials** — read your key from pi's `auth.json`, or set an environment variable
 - 🔌 **Multiple API formats** — supports Chat Completions, Responses, and Anthropic Messages APIs
 
 ## Set up
@@ -27,11 +28,39 @@ pi install npm:@joeljuca/pi-explabs
 
 You'll need an API key to authenticate. Get one at [experientiallabs.ai](https://experientiallabs.ai).
 
-Set an environment variable `EXPLABS_API_KEY` with your API key, somehow. I use and recommend [direnv](https://direnv.net), but any method will do.
+### Option 1: pi's credential store (recommended)
+
+Add an `explabs` entry to your `auth.json` (usually `~/.pi/agent/auth.json`). If you keep secrets in a password manager, point `key` at a command prefixed with `!` and the key is resolved on demand instead of being written to disk in plain text:
+
+```json
+{
+  "explabs": {
+    "type": "api_key",
+    "key": "<Your API key here>"
+  }
+}
+```
+
+```json
+{
+  "explabs": {
+    "type": "api_key",
+    "key": "!secret-tool lookup service explabs"
+  }
+}
+```
+
+Values may also reference an environment variable, like `$EXPLABS_API_KEY`.
+
+### Option 2: environment variable (fallback)
+
+When `auth.json` has no `explabs` entry, pi falls back to the `EXPLABS_API_KEY` environment variable. I use and recommend [direnv](https://direnv.net), but any method will do.
 
 ```sh
 EXPLABS_API_KEY='<Your API key here>'
 ```
+
+`auth.json` wins when both are set: a stored credential always takes priority, and the environment variable is only consulted when nothing is stored — the same rule pi applies to every provider.
 
 You're ready. Run pi normally, the extension should be automatically:
 
@@ -46,13 +75,22 @@ Usage is mostly automatic. The extension will make your pi integrate seamlessly 
 Here's what the extenstion will do:
 
 1. It registers `explabs` as a model provider in pi
+1. It resolves your API key through pi's credential store: the `explabs` entry in `auth.json` first, `EXPLABS_API_KEY` as the fallback
 1. Fetches a fresh list of available models from Experiential Labs when you open pi
 1. Refresh the list of models when you `/model` or `/reload`
 1. **API fetch**: The callback fetches models from the Experiential Labs `/v1/models` endpoint
 
 > 💡 Troubleshoot
 >
-> If something is not working properly, you're not seeing Experiential Labs' models when you `/model`, etc., the first place to check is your API key:
+> If something is not working properly, you're not seeing Experiential Labs' models when you `/model`, etc., the first place to check is your API key. Run pi with `DEBUG=pi-explabs` to see which key source the extension registered (`config` or `env:$EXPLABS_API_KEY`) and which credential pi resolved for the model refresh — the key itself is never logged.
+>
+> If you're using `auth.json`, check the entry:
+>
+> ```sh
+> cat ~/.pi/agent/auth.json
+> ```
+>
+> If you're relying on the environment variable:
 >
 > ```sh
 > echo $EXPLABS_API_KEY

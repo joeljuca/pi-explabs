@@ -41,6 +41,20 @@ function mockCtx() {
   return { ui: { notify: vi.fn() } };
 }
 
+/**
+ * RefreshModelsContext stand-in. pi resolves the effective credential itself
+ * (auth.json first, configured apiKey as fallback) and passes it here.
+ */
+function refreshContext(overrides?: Record<string, unknown>) {
+  return {
+    signal: new AbortController().signal,
+    allowNetwork: true,
+    credential: { type: "api_key", key: "xpl_test_key" },
+    publish: async () => true,
+    ...overrides,
+  };
+}
+
 const ENV_VARS = [
   "EXPLABS_API_KEY",
   "EXPLABS_BASE_URL",
@@ -88,23 +102,58 @@ describe("createExplabsExtension", () => {
         "explabs",
         expect.objectContaining({
           baseUrl: DEFAULT_BASE_URL,
-          apiKey: "",
+          apiKey: "$EXPLABS_API_KEY",
           authHeader: true,
           api: "openai-completions",
         }),
       );
     });
 
-    it("reads EXPLABS_API_KEY env var", () => {
+    it("registers a $VAR reference instead of reading EXPLABS_API_KEY at startup", () => {
+      // pi resolves the reference at request time, preferring a stored auth.json
+      // credential — the extension never touches the key itself.
       process.env.EXPLABS_API_KEY = "xpl_abc123def456abc123def456abc123def456";
       const pi = mockPi();
       createExplabsExtension()(pi as never);
 
       expect(pi.registerProvider).toHaveBeenCalledWith(
         "explabs",
-        expect.objectContaining({
-          apiKey: "xpl_abc123def456abc123def456abc123def456",
-        }),
+        expect.objectContaining({ apiKey: "$EXPLABS_API_KEY" }),
+      );
+    });
+
+    it("config param apiKey wins over apiKeyEnv", () => {
+      const pi = mockPi();
+      createExplabsExtension({ apiKey: "xpl_from_config", apiKeyEnv: "MY_CUSTOM_KEY" })(
+        pi as never,
+      );
+
+      expect(pi.registerProvider).toHaveBeenCalledWith(
+        "explabs",
+        expect.objectContaining({ apiKey: "xpl_from_config" }),
+      );
+    });
+
+    it("config param apiKey passes a !command through unresolved", () => {
+      const pi = mockPi();
+      createExplabsExtension({ apiKey: "!security find-generic-password -ws explabs" })(
+        pi as never,
+      );
+
+      expect(pi.registerProvider).toHaveBeenCalledWith(
+        "explabs",
+        expect.objectContaining({ apiKey: "!security find-generic-password -ws explabs" }),
+      );
+    });
+
+    it("config param apiKeyEnv names the fallback reference", () => {
+      process.env.MY_CUSTOM_KEY = "custom_key_value";
+      const pi = mockPi();
+      createExplabsExtension({ apiKeyEnv: "MY_CUSTOM_KEY" })(pi as never);
+
+      expect(pi.registerProvider).toHaveBeenCalledWith(
+        "explabs",
+        expect.objectContaining({ apiKey: "$MY_CUSTOM_KEY" }),
       );
     });
 
@@ -156,17 +205,6 @@ describe("createExplabsExtension", () => {
       );
     });
 
-    it("config param apiKeyEnv selects a custom env var", () => {
-      process.env.MY_CUSTOM_KEY = "custom_key_value";
-      const pi = mockPi();
-      createExplabsExtension({ apiKeyEnv: "MY_CUSTOM_KEY" })(pi as never);
-
-      expect(pi.registerProvider).toHaveBeenCalledWith(
-        "explabs",
-        expect.objectContaining({ apiKey: "custom_key_value" }),
-      );
-    });
-
     it("throws on invalid apiFormat in config", () => {
       // @ts-expect-error – testing invalid value at runtime
       expect(() => createExplabsExtension({ apiFormat: "bogus-format" })).toThrow(
@@ -210,6 +248,7 @@ describe("extension function", () => {
       const result = await handler!({ text: "/login explabs" }, ctx);
 
       expect(result).toEqual({ action: "handled" });
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("auth.json"), "info");
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("API key"), "info");
     });
 
@@ -246,7 +285,7 @@ describe("refreshModels", () => {
   it("fetches from {baseUrl}/models", async () => {
     fetch.mockResolvedValue(mockResponse({ data: [] }));
 
-    await provider.refreshModels({ signal: new AbortController().signal });
+    await provider.refreshModels(refreshContext());
 
     expect(fetch).toHaveBeenCalledWith(
       `${DEFAULT_BASE_URL}/models`,
@@ -254,11 +293,12 @@ describe("refreshModels", () => {
     );
   });
 
-  it("sends the Authorization header", async () => {
-    process.env.EXPLABS_API_KEY = "xpl_my_test_key";
+  it("sends the Authorization header from the credential pi resolved", async () => {
     fetch.mockResolvedValue(mockResponse({ data: [] }));
 
-    await provider.refreshModels({ signal: new AbortController().signal });
+    await provider.refreshModels(
+      refreshContext({ credential: { type: "api_key", key: "xpl_my_test_key" } }),
+    );
 
     expect(fetch).toHaveBeenCalledWith(
       expect.any(String),
@@ -270,11 +310,50 @@ describe("refreshModels", () => {
     );
   });
 
+  it("uses pi's stored credential even when EXPLABS_API_KEY differs", async () => {
+    process.env.EXPLABS_API_KEY = "xpl_from_env";
+    fetch.mockResolvedValue(mockResponse({ data: [] }));
+
+    await provider.refreshModels(
+      refreshContext({ credential: { type: "api_key", key: "xpl_from_auth" } }),
+    );
+
+    expect(fetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer xpl_from_auth" }),
+      }),
+    );
+  });
+
+  it("does not fetch during the cache-restore pass (allowNetwork=false)", async () => {
+    const models = await provider.refreshModels(refreshContext({ allowNetwork: false }));
+
+    expect(models).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not fetch when pi resolved no credential", async () => {
+    const models = await provider.refreshModels(refreshContext({ credential: undefined }));
+
+    expect(models).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not fetch for a non api_key credential", async () => {
+    const models = await provider.refreshModels(
+      refreshContext({ credential: { type: "oauth", access: "token" } }),
+    );
+
+    expect(models).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("passes the abort signal", async () => {
     const signal = new AbortController().signal;
     fetch.mockResolvedValue(mockResponse({ data: [] }));
 
-    await provider.refreshModels({ signal });
+    await provider.refreshModels(refreshContext({ signal }));
 
     expect(fetch).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ signal }));
   });
@@ -286,9 +365,7 @@ describe("refreshModels", () => {
       }),
     );
 
-    const models = await provider.refreshModels({
-      signal: new AbortController().signal,
-    });
+    const models = await provider.refreshModels(refreshContext());
 
     expect(models).toEqual([
       {
@@ -317,9 +394,7 @@ describe("refreshModels", () => {
       }),
     );
 
-    const models = await provider.refreshModels({
-      signal: new AbortController().signal,
-    });
+    const models = await provider.refreshModels(refreshContext());
 
     expect(models[0].name).toBe("Aion 2.0");
   });
@@ -338,9 +413,7 @@ describe("refreshModels", () => {
       }),
     );
 
-    const models = await provider.refreshModels({
-      signal: new AbortController().signal,
-    });
+    const models = await provider.refreshModels(refreshContext());
 
     expect(models[0]).toMatchObject({
       contextWindow: 200_000,
@@ -366,7 +439,7 @@ describe("refreshModels", () => {
       ),
     );
 
-    await expect(provider.refreshModels({ signal: new AbortController().signal })).rejects.toThrow(
+    await expect(provider.refreshModels(refreshContext())).rejects.toThrow(
       /Failed to fetch Experiential Labs models/,
     );
   });
@@ -374,7 +447,7 @@ describe("refreshModels", () => {
   it("throws when response body lacks data array", async () => {
     fetch.mockResolvedValue(mockResponse({ error: "not found" }));
 
-    await expect(provider.refreshModels({ signal: new AbortController().signal })).rejects.toThrow(
+    await expect(provider.refreshModels(refreshContext())).rejects.toThrow(
       /Invalid response format/,
     );
   });
